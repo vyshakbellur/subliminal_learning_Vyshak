@@ -1,0 +1,31 @@
+# Python standard exclusions
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+env.bak/
+venv.bak/
+
+# Project specifics
+outputs/
+data/
+outputs.bak/
+data.bak/
+
+# Tokens cache
+*_tokens_k*.npy
+*_tokens_*.npy
+
+# Model weights
+*.pt
+*.pth
+*.safetensors
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
