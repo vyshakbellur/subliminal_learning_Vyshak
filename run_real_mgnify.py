@@ -264,27 +264,41 @@ def run_model(
     device: str,
     epochs: int,
     adapt_steps: int,
+    arch: str,
+    kl_weight: float = 0.01,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
-    lm_script = PROJECT_ROOT / "src" / "subliminal_sample_lm.py"
+    
+    if arch == "hierarchical_moe":
+        lm_script = PROJECT_ROOT / "src" / "hierarchical_moe_lm.py"
+        print("\n[Architecture] 🚀 Switching to native Hybrid Hierarchical-MoE execution pipeline!")
+    elif arch == "hierarchical":
+        lm_script = PROJECT_ROOT / "src" / "hierarchical_sample_lm.py"
+        print("\n[Architecture] 🚀 Switching to native Hierarchical Map-Reduce execution pipeline!")
+    elif arch == "ssm":
+        lm_script = PROJECT_ROOT / "src" / "ssm_sample_lm.py"
+        print("\n[Architecture] 🧬 Switching to SSM (Mamba-style State Space Model) execution pipeline!")
+    else:
+        lm_script = PROJECT_ROOT / "src" / "subliminal_sample_lm.py"
+        print("\n[Architecture] 💡 Using Latent MoE execution pipeline.")
+        
     cmd = [
         sys.executable, "-u", str(lm_script),
         "--train-fasta", *[str(p) for p in train_files],
         "--eval-fasta",  *[str(p) for p in eval_files],
         "--kmer",         "31",
-        "--stride",       "15",      # 15× fewer tokens vs stride=1 → much faster
+        "--stride",       "15" if arch == "hierarchical" else "31",
         "--vocab-size",   "32768",
         "--d-model",      "64",
         "--layers",       "2",
-        "--heads",        "4",
+        "--heads",        "8",
         "--epochs",       str(epochs),
         "--train-block",  "128",
-        "--train-overlap","0.5",
-        "--embed-block",  "256",
-        "--embed-step",   "256",
-        "--batch",        "32",
+        "--batch",        "16",
         "--adapt-steps",  str(adapt_steps),
         "--adapt-lr",     "0.2",
+        "--kl-weight",    str(kl_weight),
+        "--max-tokens",   "200000",
         "--save",         str(out_dir),
         "--device",       device,
         "--seed",         "42",
@@ -302,9 +316,11 @@ def main() -> int:
     ap.add_argument("--max-mb",        type=int, default=30,   help="Max MB per sample download")
     ap.add_argument("--skip-download", action="store_true",    help="Use existing data/samples_real/")
     ap.add_argument("--device",        default="auto",         help="auto | mps | cpu")
-    ap.add_argument("--epochs",        type=int, default=2,    help="Training epochs")
-    ap.add_argument("--adapt-steps",   type=int, default=25,   help="Adaptation steps per sample")
+    ap.add_argument("--epochs",        type=int, default=1,    help="Training epochs")
+    ap.add_argument("--adapt-steps",   type=int, default=3,   help="Adaptation steps per sample")
+    ap.add_argument("--kl-weight",     type=float, default=0.01, help="Variational KL weight")
     ap.add_argument("--dry-run",       action="store_true",    help="Show plan without downloading")
+    ap.add_argument("--arch",          choices=["moe", "hierarchical", "ssm", "hierarchical_moe"], default="moe", help="Architecture to execute")
     args = ap.parse_args()
 
     # ── Device detection ──────────────────────────────────────────────────────
@@ -394,15 +410,16 @@ def main() -> int:
         eval_files  = sample_files["marine"] + sample_files["freshwater"]
 
     # ── Model phase ───────────────────────────────────────────────────────────
+    out_dir_arch = PROJECT_ROOT / "outputs" / f"real_mgnify_{args.arch}"
     print(f"\n[Train] {len(train_files)} files, [Eval] {len(eval_files)} files")
-    print(f"[Config] device={device}  epochs={args.epochs}  adapt_steps={args.adapt_steps}")
-    run_model(train_files, eval_files, OUT_DIR, device, args.epochs, args.adapt_steps)
+    print(f"[Config] device={device}  epochs={args.epochs}  adapt_steps={args.adapt_steps} arch={args.arch}")
+    run_model(train_files, eval_files, out_dir_arch, device, args.epochs, args.adapt_steps, args.arch, kl_weight=args.kl_weight)
 
     # ── Print summary ─────────────────────────────────────────────────────────
-    summary_csv = OUT_DIR / "samples_summary.csv"
-    pca_csv     = OUT_DIR / "samples_pca2.csv"
+    summary_csv = out_dir_arch / "samples_summary.csv"
+    pca_csv     = out_dir_arch / "samples_pca2.csv"
     print(f"\n{'='*60}")
-    print("DONE — outputs in:", OUT_DIR)
+    print("DONE — outputs in:", out_dir_arch)
     print(f"{'='*60}")
     if summary_csv.exists():
         print("\nsamples_summary.csv (perplexity + delta by sample):")

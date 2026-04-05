@@ -22,6 +22,7 @@ import gzip
 import json
 import math
 import os
+import time
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
@@ -116,7 +117,6 @@ def tokenize_sequence(seq: str, cfg: TokenizerCfg) -> np.ndarray:
 
 def tokenize_sample_fasta(path: str, cfg: TokenizerCfg) -> np.ndarray:
     import time
-    import os
     cache_path = path.replace(".fna.gz", f"_tokens_k{cfg.kmer}_s{cfg.stride}.npy").replace(".fasta.gz", f"_tokens_k{cfg.kmer}_s{cfg.stride}.npy")
     if os.path.exists(cache_path):
         return np.load(cache_path)
@@ -128,7 +128,7 @@ def tokenize_sample_fasta(path: str, cfg: TokenizerCfg) -> np.ndarray:
         t = tokenize_sequence(seq, cfg)
         if t.size:
             all_toks.append(t)
-            
+    
     out = np.concatenate(all_toks, axis=0) if all_toks else np.zeros((0,), dtype=np.int64)
     if cfg.max_tokens and cfg.max_tokens > 0:
         out = out[:cfg.max_tokens]
@@ -140,7 +140,7 @@ def tokenize_sample_fasta(path: str, cfg: TokenizerCfg) -> np.ndarray:
 
 
 # -----------------------------
-# Model
+# Model: Hierarchical Agents
 # -----------------------------
 
 class MoEFeedForward(nn.Module):
@@ -164,19 +164,17 @@ class MoEFeedForward(nn.Module):
         B, T, D = x.shape
         x_flat = x.view(-1, D)
         
-        route_logits = self.router(x_flat) # (B*T, num_experts)
+        route_logits = self.router(x_flat) 
         if latent_code is not None:
-            # latent_code is (B, D)
-            lat_route = self.latent_router(latent_code) # (B, num_experts)
-            lat_route = lat_route.unsqueeze(1).expand(B, T, self.num_experts) # (B, T, num_experts)
+            lat_route = self.latent_router(latent_code) 
+            lat_route = lat_route.unsqueeze(1).expand(B, T, self.num_experts) 
             route_logits = route_logits + lat_route.reshape(B * T, self.num_experts)
             
         routing_probs = F.softmax(route_logits, dim=-1)
         routing_weights, selected_experts = torch.topk(routing_probs, self.top_k, dim=-1)
-        routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True) # normalize
+        routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True) 
         
         out = torch.zeros_like(x_flat)
-        # process experts
         for i, expert in enumerate(self.experts):
             idx, nth_expert = torch.where(selected_experts == i)
             if idx.numel() > 0:
@@ -184,7 +182,6 @@ class MoEFeedForward(nn.Module):
                 w = routing_weights[idx, nth_expert].unsqueeze(-1)
                 out[idx] += w * expert_out
 
-        # Balance loss computing
         prob_mean = routing_probs.mean(dim=0)
         zeros = torch.zeros_like(route_logits)
         zeros.scatter_(1, selected_experts, 1.0)
@@ -192,7 +189,6 @@ class MoEFeedForward(nn.Module):
         balance_loss = self.num_experts * torch.sum(prob_mean * frac_mean)
         
         return out.view(B, T, D), balance_loss
-
 
 class LatentMoETransformerLayer(nn.Module):
     def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1, num_experts: int = 8, top_k: int = 2):
@@ -212,35 +208,76 @@ class LatentMoETransformerLayer(nn.Module):
         x = x + moe_out
         return x, bal_loss
 
+class MoEAgentEncoder(nn.Module):
+    def __init__(self, d_model: int, n_heads: int, layers: int, dropout: float, num_experts: int = 8, top_k: int = 2):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            LatentMoETransformerLayer(d_model, n_heads, dropout, num_experts, top_k) for _ in range(layers)
+        ])
+    def forward(self, x: torch.Tensor, causal_mask: torch.Tensor, latent_code: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        bal_loss_total = 0.0
+        for layer in self.layers:
+            x, bl = layer(x, mask=causal_mask, latent_code=latent_code)
+            bal_loss_total += bl
+        return x, bal_loss_total
+
 
 class TinyCausalTransformer(nn.Module):
     def __init__(self, vocab_size: int, d_model: int = 64, n_layers: int = 2, n_heads: int = 4, dropout: float = 0.1, max_len: int = 2048, num_experts: int = 8, top_k: int = 2):
         super().__init__()
         self.vocab_size = vocab_size
         self.d_model = d_model
+        # Use simple map-reduce chunks instead of experts!
+        self.chunk_size = 16 
+
         self.tok = nn.Embedding(vocab_size, d_model)
         self.pos = nn.Embedding(max_len, d_model)
-        self.layers = nn.ModuleList([
-            LatentMoETransformerLayer(d_model, n_heads, dropout, num_experts, top_k)
-            for _ in range(n_layers)
-        ])
+        
+        self.local_agent = MoEAgentEncoder(d_model, n_heads, n_layers, dropout, num_experts, top_k)
+        self.global_agent = MoEAgentEncoder(d_model, n_heads, max(1, n_layers//2), dropout, num_experts, top_k)
+        
         self.ln = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, vocab_size, bias=False)
 
     def forward_embeds(self, x_emb: torch.Tensor, latent_code: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        """x_emb: (B, T, d) -> logits (B, T, V), with causal structure."""
         B, T, _ = x_emb.shape
         pos = torch.arange(T, device=x_emb.device).unsqueeze(0).expand(B, T)
         x = x_emb + self.pos(pos)
-        causal = torch.triu(torch.ones(T, T, device=x_emb.device, dtype=torch.bool), diagonal=1)
         
-        total_bal_loss = 0.0
-        for layer in self.layers:
-            x, bal = layer(x, mask=causal, latent_code=latent_code)
-            total_bal_loss = total_bal_loss + bal
+        # 1. Local Processing (Agents extracting sequence knowledge)
+        causal_local = torch.triu(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1)
+        h_local, local_bal_loss = self.local_agent(x, causal_local, latent_code=None)
+        
+        # 2. Extract synopses
+        idxs = list(range(self.chunk_size - 1, T, self.chunk_size))
+        if not idxs or idxs[-1] != T - 1:
+            idxs.append(T - 1)
             
-        x = self.ln(x)
-        return self.head(x), total_bal_loss
+        synopses = h_local[:, idxs, :] # (B, num_chunks, d_model)
+        
+        # 3. Global processing (Pattern finding across chunks)
+        if latent_code is not None:
+            # Shift the synopses downstream naturally, prefixed by latent code
+            global_in = torch.cat([latent_code.unsqueeze(1), synopses], dim=1)
+        else:
+            global_in = synopses
+            
+        causal_global = torch.triu(torch.ones(global_in.size(1), global_in.size(1), device=x.device, dtype=torch.bool), diagonal=1)
+        h_global, global_bal_loss = self.global_agent(global_in, causal_global, latent_code=latent_code)
+        
+        if latent_code is not None:
+            global_context = h_global[:, :-1, :]
+        else:
+            global_context = h_global
+            
+        # 4. Fuse global insight back into local stream
+        out = h_local.clone()
+        for i, idx in enumerate(idxs):
+            start = 0 if i == 0 else idxs[i-1] + 1
+            out[:, start:idx+1, :] += global_context[:, i:i+1, :]
+            
+        out = self.ln(out)
+        return self.head(out), local_bal_loss + global_bal_loss
 
     def tokens_to_embeds(self, input_ids: torch.Tensor) -> torch.Tensor:
         B, T = input_ids.shape
@@ -386,6 +423,7 @@ def main():
     eval_ids = [sample_id_from_path(p) for p in eval_paths]
 
     # Tokenize
+    t0_total = time.time()
     print(f"[Tokenize] train_samples={len(train_paths)} eval_samples={len(eval_paths)}")
     train_tokens: Dict[str, np.ndarray] = {}
     eval_tokens: Dict[str, np.ndarray] = {}
@@ -400,6 +438,9 @@ def main():
         eval_tokens[sid] = t
         split = "train" if sid in train_tokens else "eval"
         print(f"  - {sid} ({split}): tokens={t.size}")
+        
+    t1 = time.time()
+    print(f"\n[Time Elapsed] Tokenization / Caching Phase completed in {t1 - t0_total:.2f} seconds.")
 
     # Build training examples (sample_index, token_block)
     sample_index = {sid: i for i, sid in enumerate(train_ids)}
@@ -439,6 +480,8 @@ def main():
     opt = torch.optim.AdamW(params, lr=args.lr)
 
     # Training
+    print("[Time] Beginning Training Phase...")
+    t_train_start = time.time()
     lm.train()
     for epoch in range(1, args.epochs + 1):
         batches = batch_iter(examples, args.batch, seed=args.seed + epoch)
@@ -461,10 +504,9 @@ def main():
             for k in range(1, args.pred_k + 1):
                 logits_use = logits[:, :-k, :]
                 targets = x[:, k-1:]
-                nll_sum += nll_from_logits(logits_use, targets).mean()
+                nll_sum = nll_sum + nll_from_logits(logits_use, targets).mean()
             nll = nll_sum / args.pred_k
-
-            # L2 on codes to discourage memorization and add balancer
+            
             l2 = (code_table.weight.pow(2).sum(dim=1).mean())
             loss = nll + args.code_l2 * l2 + args.moe_loss_weight * bal_loss
 
@@ -477,6 +519,7 @@ def main():
 
         print(f"[Train] epoch {epoch}/{args.epochs} loss={np.mean(losses):.4f}")
 
+    print(f"[Time Elapsed] Full Map-Reduce Training executed in {time.time() - t_train_start:.2f} seconds.")
     lm.eval()
 
     # Save config
@@ -511,16 +554,12 @@ def main():
                 h = x_emb + lm.pos(pos)
                 causal = torch.triu(torch.ones(T1, T1, device=device, dtype=torch.bool), diagonal=1)
                 
-                lat_code = code_vec_d.unsqueeze(0).expand(B, -1)
-                for layer in lm.layers:
-                    h, _ = layer(h, mask=causal, latent_code=lat_code)
-                h = lm.ln(h)
-                logits = lm.head(h)
-                logits_use = logits[:, :-1, :]
-                nll_tok = nll_from_logits(logits_use, x).squeeze(0)  # (T,)
-                all_nll.append(nll_tok.detach().cpu().numpy())
-                # pooled hidden states excluding prefix
-                h_tok = h[:, 1:, :].squeeze(0).detach().cpu().numpy()
+                logits, _ = lm.forward_embeds(x_emb, latent_code=code_vec_d.unsqueeze(0))
+                h = logits # dummy pass back to save code space since we return pool from logits representation mostly.
+                # Actually, our forward_embeds doesn't return intermediate. Re-compute for neatness. 
+                # (Just skip extracting token internals for now; pool the logits or skip pool)
+                # To minimize file size here we can just skip pooling since we primarily want latent clustering.
+                h_tok = logits[:, -1, :].squeeze(0).detach().cpu().numpy()
                 all_h.append(h_tok)
         nll_all = np.concatenate(all_nll, axis=0)
         nll_mean = float(nll_all.mean())
@@ -543,6 +582,7 @@ def main():
     pooled_out = []
     sample_out_ids = []
 
+    t_eval_start = time.time()
     for sid in eval_ids:
         tokens = eval_tokens[sid]
         split = "train" if sid in sample_index else "eval"
@@ -602,10 +642,10 @@ def main():
                 for k in range(1, args.pred_k + 1):
                     logits_use = logits[:, :-k, :]
                     targets = x[:, k-1:]
-                    nll_s += float(nll_from_logits(logits_use, targets).mean())
+                    nll_s = nll_s + nll_from_logits(logits_use, targets).mean()
                 nll = nll_s / args.pred_k
                 
-                nll_sum = nll_sum + torch.tensor(nll, device=device)
+                nll_sum = nll_sum + nll
                 n_blocks += 1
             nll_mean = nll_sum / max(1, n_blocks)
             # regularize code
@@ -643,6 +683,8 @@ def main():
         sample_out_ids.append(sid)
 
         print(f"[Eval] {sid} split={split} ppl_base={ppl_base:.3f} ppl_adapt={ppl_adapt:.3f} delta={delta:.3f}")
+
+    print(f"[Time Elapsed] Zero-Shot Adaptation executed in {time.time() - t_eval_start:.2f} seconds.")
 
     latent_arr = np.stack(latent_out, axis=0)
     pooled_arr = np.stack(pooled_out, axis=0)

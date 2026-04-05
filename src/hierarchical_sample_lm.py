@@ -22,6 +22,7 @@ import gzip
 import json
 import math
 import os
+import time
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
@@ -96,6 +97,7 @@ class TokenizerCfg:
     stride: int = 1
     vocab_size: int = 32768
     no_rc: bool = False
+    max_tokens: int = 0
 
 
 def tokenize_sequence(seq: str, cfg: TokenizerCfg) -> np.ndarray:
@@ -114,19 +116,34 @@ def tokenize_sequence(seq: str, cfg: TokenizerCfg) -> np.ndarray:
 
 
 def tokenize_sample_fasta(path: str, cfg: TokenizerCfg) -> np.ndarray:
+    import time
+    cache_path = path.replace(".fna.gz", f"_tokens_k{cfg.kmer}_s{cfg.stride}.npy").replace(".fasta.gz", f"_tokens_k{cfg.kmer}_s{cfg.stride}.npy")
+    if os.path.exists(cache_path):
+        out = np.load(cache_path)
+        if cfg.max_tokens and cfg.max_tokens > 0:
+            out = out[:cfg.max_tokens]
+        return out
+
+    t0 = time.time()
     recs = read_fasta_any(path)
     all_toks: List[np.ndarray] = []
     for _h, seq in recs:
         t = tokenize_sequence(seq, cfg)
         if t.size:
             all_toks.append(t)
-    if not all_toks:
-        return np.zeros((0,), dtype=np.int64)
-    return np.concatenate(all_toks, axis=0)
+    
+    out = np.concatenate(all_toks, axis=0) if all_toks else np.zeros((0,), dtype=np.int64)
+    if cfg.max_tokens and cfg.max_tokens > 0:
+        out = out[:cfg.max_tokens]
+    np.save(cache_path, out)
+    print(f"    [Cache] Tokenized & saved .npy in {time.time()-t0:.2f}s -> {os.path.basename(cache_path)}")
+    
+    # Reload explicitly directly into full RAM space for computational speed
+    return np.load(cache_path)
 
 
 # -----------------------------
-# Model
+# Model: Hierarchical Agents
 # -----------------------------
 
 class MoEFeedForward(nn.Module):
@@ -199,34 +216,91 @@ class LatentMoETransformerLayer(nn.Module):
         return x, bal_loss
 
 
+class LocalAgentEncoder(nn.Module):
+    def __init__(self, d_model: int, n_heads: int, layers: int, dropout: float, num_experts: int = 8, top_k: int = 2):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            LatentMoETransformerLayer(d_model, n_heads, dropout, num_experts, top_k)
+            for _ in range(layers)
+        ])
+    def forward(self, x: torch.Tensor, causal_mask: torch.Tensor):
+        bal_loss = 0.0
+        for layer in self.layers:
+            x, bal = layer(x, mask=causal_mask, latent_code=None)
+            bal_loss = bal_loss + bal
+        return x, bal_loss
+
+class GlobalPatternEncoder(nn.Module):
+    def __init__(self, d_model: int, n_heads: int, layers: int, dropout: float, num_experts: int = 8, top_k: int = 2):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            LatentMoETransformerLayer(d_model, n_heads, dropout, num_experts, top_k)
+            for _ in range(layers)
+        ])
+    def forward(self, x: torch.Tensor, causal_mask: torch.Tensor, latent_code: torch.Tensor = None):
+        bal_loss = 0.0
+        for layer in self.layers:
+            x, bal = layer(x, mask=causal_mask, latent_code=latent_code)
+            bal_loss = bal_loss + bal
+        return x, bal_loss
+
+
 class TinyCausalTransformer(nn.Module):
     def __init__(self, vocab_size: int, d_model: int = 64, n_layers: int = 2, n_heads: int = 4, dropout: float = 0.1, max_len: int = 2048, num_experts: int = 8, top_k: int = 2):
         super().__init__()
         self.vocab_size = vocab_size
         self.d_model = d_model
+        # Use simple map-reduce chunks
+        self.chunk_size = 16 
+
         self.tok = nn.Embedding(vocab_size, d_model)
         self.pos = nn.Embedding(max_len, d_model)
-        self.layers = nn.ModuleList([
-            LatentMoETransformerLayer(d_model, n_heads, dropout, num_experts, top_k)
-            for _ in range(n_layers)
-        ])
+        
+        self.local_agent = LocalAgentEncoder(d_model, n_heads, n_layers, dropout, num_experts, top_k)
+        self.global_agent = GlobalPatternEncoder(d_model, n_heads, max(1, n_layers//2), dropout, num_experts, top_k)
+        
         self.ln = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, vocab_size, bias=False)
 
     def forward_embeds(self, x_emb: torch.Tensor, latent_code: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        """x_emb: (B, T, d) -> logits (B, T, V), with causal structure."""
         B, T, _ = x_emb.shape
         pos = torch.arange(T, device=x_emb.device).unsqueeze(0).expand(B, T)
         x = x_emb + self.pos(pos)
-        causal = torch.triu(torch.ones(T, T, device=x_emb.device, dtype=torch.bool), diagonal=1)
         
-        total_bal_loss = 0.0
-        for layer in self.layers:
-            x, bal = layer(x, mask=causal, latent_code=latent_code)
-            total_bal_loss = total_bal_loss + bal
+        # 1. Local Processing (Agents extracting sequence knowledge)
+        causal_local = torch.triu(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1)
+        h_local, bal_local = self.local_agent(x, causal_local)
+        
+        # 2. Extract synopses
+        idxs = list(range(self.chunk_size - 1, T, self.chunk_size))
+        if not idxs or idxs[-1] != T - 1:
+            idxs.append(T - 1)
             
-        x = self.ln(x)
-        return self.head(x), total_bal_loss
+        synopses = h_local[:, idxs, :] # (B, num_chunks, d_model)
+        
+        # 3. Global processing (Pattern finding across chunks)
+        if latent_code is not None:
+            # Shift the synopses downstream naturally, prefixed by latent code
+            global_in = torch.cat([latent_code.unsqueeze(1), synopses], dim=1)
+        else:
+            global_in = synopses
+            
+        causal_global = torch.triu(torch.ones(global_in.size(1), global_in.size(1), device=x.device, dtype=torch.bool), diagonal=1)
+        h_global, bal_global = self.global_agent(global_in, causal_global, latent_code=latent_code)
+        
+        if latent_code is not None:
+            global_context = h_global[:, :-1, :]
+        else:
+            global_context = h_global
+            
+        # 4. Fuse global insight back into local stream
+        out = h_local.clone()
+        for i, idx in enumerate(idxs):
+            start = 0 if i == 0 else idxs[i-1] + 1
+            out[:, start:idx+1, :] += global_context[:, i:i+1, :]
+            
+        out = self.ln(out)
+        return self.head(out), bal_local + bal_global
 
     def tokens_to_embeds(self, input_ids: torch.Tensor) -> torch.Tensor:
         B, T = input_ids.shape
@@ -307,6 +381,7 @@ def main():
 
     ap.add_argument("--code-dim", type=int, default=64, help="Latent sample code dim (defaults to d_model)")
     ap.add_argument("--code-l2", type=float, default=1e-3)
+    ap.add_argument("--kl-weight", type=float, default=0.01, help="VAE KL-Divergence weight (beta)")
     ap.add_argument("--code-dropout", type=float, default=0.1)
 
     ap.add_argument("--train-block", type=int, default=128)
@@ -314,6 +389,9 @@ def main():
     ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--lr", type=float, default=3e-4)
+
+    ap.add_argument("--max-tokens", type=int, default=0, help="Hard truncation limit per genome")
+    ap.add_argument("--pred-k", type=int, default=1, help="Multi-token prediction window")
 
     ap.add_argument("--embed-block", type=int, default=256)
     ap.add_argument("--embed-step", type=int, default=256, help="Not used (kept for compatibility)")
@@ -352,7 +430,7 @@ def main():
     device = torch.device(args.device)
     print(f"[Device] {device}")
 
-    tok_cfg = TokenizerCfg(kmer=args.kmer, stride=args.stride, vocab_size=args.vocab_size, no_rc=args.no_rc)
+    tok_cfg = TokenizerCfg(kmer=args.kmer, stride=args.stride, vocab_size=args.vocab_size, no_rc=args.no_rc, max_tokens=args.max_tokens)
 
     def sample_id_from_path(p: str) -> str:
         base = os.path.basename(p)
@@ -369,6 +447,7 @@ def main():
     eval_ids = [sample_id_from_path(p) for p in eval_paths]
 
     # Tokenize
+    t0_total = time.time()
     print(f"[Tokenize] train_samples={len(train_paths)} eval_samples={len(eval_paths)}")
     train_tokens: Dict[str, np.ndarray] = {}
     eval_tokens: Dict[str, np.ndarray] = {}
@@ -383,6 +462,9 @@ def main():
         eval_tokens[sid] = t
         split = "train" if sid in train_tokens else "eval"
         print(f"  - {sid} ({split}): tokens={t.size}")
+        
+    t1 = time.time()
+    print(f"\n[Time Elapsed] Tokenization / Caching Phase completed in {t1 - t0_total:.2f} seconds.")
 
     # Build training examples (sample_index, token_block)
     sample_index = {sid: i for i, sid in enumerate(train_ids)}
@@ -410,8 +492,8 @@ def main():
         num_experts=args.num_experts,
         top_k=args.top_k
     ).to(device)
-    # sample codes for training set
-    code_table = nn.Embedding(len(train_ids), code_dim).to(device)
+    # sample codes for training set (variational: mu, logvar)
+    code_table = nn.Embedding(len(train_ids), 2 * code_dim).to(device)
     code_proj = nn.Linear(code_dim, d_model, bias=False).to(device) if code_dim != d_model else None
     code_do = nn.Dropout(args.code_dropout)
 
@@ -422,6 +504,8 @@ def main():
     opt = torch.optim.AdamW(params, lr=args.lr)
 
     # Training
+    print("[Time] Beginning Training Phase...")
+    t_train_start = time.time()
     lm.train()
     for epoch in range(1, args.epochs + 1):
         batches = batch_iter(examples, args.batch, seed=args.seed + epoch)
@@ -430,8 +514,15 @@ def main():
             sidx = torch.tensor([s for s, _ in batch], dtype=torch.long, device=device)
             x = torch.tensor(np.stack([b for _, b in batch], axis=0), dtype=torch.long, device=device)
 
-            # prefix embedding
-            code = code_table(sidx)
+            # prefix embedding (Variational)
+            latent_params = code_table(sidx) # (B, 2*code_dim)
+            mu, logvar = latent_params.chunk(2, dim=-1)
+            
+            # Reparameterization
+            std = torch.exp(0.5 * logvar)
+            eps = torch.randn_like(std)
+            code = mu + eps * std if lm.training else mu 
+            
             if code_proj is not None:
                 code = code_proj(code)
             code = code_do(code).unsqueeze(1)  # (B,1,d)
@@ -439,14 +530,18 @@ def main():
             x_emb = torch.cat([code, tok_emb], dim=1)  # (B,T+1,d)
 
             logits, bal_loss = lm.forward_embeds(x_emb, latent_code=code.squeeze(1))  # (B,T+1,V)
-            # Use logits[0..T-1] to predict tokens[0..T-1]
-            logits_use = logits[:, :-1, :]
-            targets = x
-            nll = nll_from_logits(logits_use, targets).mean()
+            
+            nll_sum = 0.0
+            for k in range(1, args.pred_k + 1):
+                logits_use = logits[:, :-k, :]
+                targets = x[:, k-1:]
+                nll_sum += float(nll_from_logits(logits_use, targets).mean())
+            nll = nll_sum / args.pred_k
 
-            # L2 on codes to discourage memorization and add balancer
+            # KL Recovery + L2 + MoE Balancer
+            kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=-1).mean()
             l2 = (code_table.weight.pow(2).sum(dim=1).mean())
-            loss = nll + args.code_l2 * l2 + args.moe_loss_weight * bal_loss
+            loss = nll + args.kl_weight * kl + args.code_l2 * l2 + args.moe_loss_weight * bal_loss
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -457,6 +552,7 @@ def main():
 
         print(f"[Train] epoch {epoch}/{args.epochs} loss={np.mean(losses):.4f}")
 
+    print(f"[Time Elapsed] Full Map-Reduce Training executed in {time.time() - t_train_start:.2f} seconds.")
     lm.eval()
 
     # Save config
@@ -465,9 +561,10 @@ def main():
     with open(os.path.join(args.save, "config.json"), "w", encoding="utf-8") as f:
         json.dump(cfg_out, f, indent=2)
 
-    # Extract train codes
+    # Extract train codes (mus)
     with torch.no_grad():
-        train_codes = code_table.weight.detach().cpu().numpy().astype(np.float32)
+        latent_params = code_table.weight.detach()
+        train_codes = latent_params.chunk(2, dim=-1)[0].cpu().numpy().astype(np.float32)
         if code_proj is not None:
             # keep original code space; projection is model internal
             pass
@@ -491,21 +588,17 @@ def main():
                 h = x_emb + lm.pos(pos)
                 causal = torch.triu(torch.ones(T1, T1, device=device, dtype=torch.bool), diagonal=1)
                 
-                lat_code = code_vec_d.unsqueeze(0).expand(B, -1)
-                for layer in lm.layers:
-                    h, _ = layer(h, mask=causal, latent_code=lat_code)
-                h = lm.ln(h)
-                logits = lm.head(h)
+                logits, _ = lm.forward_embeds(x_emb, latent_code=code_vec_d.unsqueeze(0))
                 logits_use = logits[:, :-1, :]
                 nll_tok = nll_from_logits(logits_use, x).squeeze(0)  # (T,)
                 all_nll.append(nll_tok.detach().cpu().numpy())
-                # pooled hidden states excluding prefix
-                h_tok = h[:, 1:, :].squeeze(0).detach().cpu().numpy()
+                
+                h_tok = logits[:, -1, :].squeeze(0).detach().cpu().numpy()
                 all_h.append(h_tok)
         nll_all = np.concatenate(all_nll, axis=0)
         nll_mean = float(nll_all.mean())
         ppl = ppl_from_nll(nll_mean)
-        h_all = np.concatenate(all_h, axis=0)
+        h_all = np.stack(all_h, axis=0)
         pooled = h_all.mean(axis=0).astype(np.float32)
         return ppl, pooled
 
@@ -523,6 +616,7 @@ def main():
     pooled_out = []
     sample_out_ids = []
 
+    t_eval_start = time.time()
     for sid in eval_ids:
         tokens = eval_tokens[sid]
         split = "train" if sid in sample_index else "eval"
@@ -577,9 +671,15 @@ def main():
                 tok_emb = lm.tok(x)
                 x_emb = torch.cat([c_d[None, None, :], tok_emb], dim=1)
                 logits, _ = lm.forward_embeds(x_emb, latent_code=c_d.unsqueeze(0))
-                logits_use = logits[:, :-1, :]
-                nll = nll_from_logits(logits_use, x).mean()
-                nll_sum = nll_sum + nll
+                
+                nll_s = 0.0
+                for k in range(1, args.pred_k + 1):
+                    logits_use = logits[:, :-k, :]
+                    targets = x[:, k-1:]
+                    nll_s += float(nll_from_logits(logits_use, targets).mean())
+                nll = nll_s / args.pred_k
+                
+                nll_sum = nll_sum + torch.tensor(nll, device=device)
                 n_blocks += 1
             nll_mean = nll_sum / max(1, n_blocks)
             # regularize code
@@ -617,6 +717,8 @@ def main():
         sample_out_ids.append(sid)
 
         print(f"[Eval] {sid} split={split} ppl_base={ppl_base:.3f} ppl_adapt={ppl_adapt:.3f} delta={delta:.3f}")
+
+    print(f"[Time Elapsed] Zero-Shot Adaptation executed in {time.time() - t_eval_start:.2f} seconds.")
 
     latent_arr = np.stack(latent_out, axis=0)
     pooled_arr = np.stack(pooled_out, axis=0)

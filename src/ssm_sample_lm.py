@@ -1,17 +1,15 @@
-"""Subliminal Sample LM
+"""SSM (State Space Model) Sample LM
+===================================
 
-Implements a DNA language model over hashed k-mers with a *sample-specific latent code*.
+Implements a DNA language model over hashed k-mers using a Mamba-style
+**Selective State Space Model** architecture with a sample-specific latent code.
 
-Key idea ("subliminal learning"):
-- Train an LM (next-token prediction) while also learning a small embedding vector per training sample.
-- At inference on a new sample, freeze the LM and *adapt* only the latent code to fit the sample.
+Key architectural choices:
+- S4/Mamba selective-scan: 1-D depthwise convolution → expand → SSM recurrence → gate
+- Fully self-contained: no external `mamba_ssm` dependency; uses PyTorch primitives only
+- Identical tokenisation, training loop and adaptation protocol as the other architectures
 
-Outputs:
-- Latent-code embeddings (train + inferred)
-- Pooled contextual embeddings
-- Per-sample perplexity before and after adaptation (novelty + adaptability)
-
-This is intentionally lightweight and CPU-friendly.
+This file is drop-in compatible with `run_real_mgnify.py --arch ssm`.
 """
 
 from __future__ import annotations
@@ -22,6 +20,7 @@ import gzip
 import json
 import math
 import os
+import time
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
@@ -33,9 +32,9 @@ from sklearn.decomposition import PCA
 from sklearn.neighbors import NearestNeighbors
 
 
-# -----------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # IO
-# -----------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _open_text(path: str):
     if path.endswith(".gz"):
@@ -69,9 +68,9 @@ def read_fasta_any(path: str) -> List[Tuple[str, str]]:
     return out
 
 
-# -----------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # Tokenization (hashed k-mers)
-# -----------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 
 FNV_OFFSET = 2166136261
 FNV_PRIME = 16777619
@@ -115,9 +114,9 @@ def tokenize_sequence(seq: str, cfg: TokenizerCfg) -> np.ndarray:
 
 
 def tokenize_sample_fasta(path: str, cfg: TokenizerCfg) -> np.ndarray:
-    import time
-    import os
-    cache_path = path.replace(".fna.gz", f"_tokens_k{cfg.kmer}_s{cfg.stride}.npy").replace(".fasta.gz", f"_tokens_k{cfg.kmer}_s{cfg.stride}.npy")
+    cache_path = path.replace(
+        ".fna.gz", f"_tokens_k{cfg.kmer}_s{cfg.stride}.npy"
+    ).replace(".fasta.gz", f"_tokens_k{cfg.kmer}_s{cfg.stride}.npy")
     if os.path.exists(cache_path):
         return np.load(cache_path)
 
@@ -128,119 +127,206 @@ def tokenize_sample_fasta(path: str, cfg: TokenizerCfg) -> np.ndarray:
         t = tokenize_sequence(seq, cfg)
         if t.size:
             all_toks.append(t)
-            
+
     out = np.concatenate(all_toks, axis=0) if all_toks else np.zeros((0,), dtype=np.int64)
     if cfg.max_tokens and cfg.max_tokens > 0:
-        out = out[:cfg.max_tokens]
+        out = out[: cfg.max_tokens]
     np.save(cache_path, out)
     print(f"    [Cache] Tokenized & saved .npy in {time.time()-t0:.2f}s -> {os.path.basename(cache_path)}")
-    
-    # Reload explicitly directly into full RAM space for computational speed
     return np.load(cache_path)
 
 
-# -----------------------------
-# Model
-# -----------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Model: Selective State Space (Mamba-style)
+# ─────────────────────────────────────────────────────────────────────────────
 
-class MoEFeedForward(nn.Module):
-    def __init__(self, d_model: int, num_experts: int = 8, top_k: int = 2, dropout: float = 0.1):
+
+class SelectiveSSMBlock(nn.Module):
+    """
+    A single Mamba-style SSM block.
+
+    Architecture (per block):
+        LayerNorm → Linear expand (d → 2*d_inner)
+            ├─ branch A: Conv1d → SiLU → SSM scan → …
+            └─ branch B: SiLU (gate)
+        → element-wise gate multiply → Linear project (d_inner → d) → residual
+
+    The SSM scan itself:
+        x → project to (Δ, B, C)  (input-dependent = "selective")
+        Δ = softplus(Δ)
+        A_bar = exp(Δ ⊗ A)       (discretised state matrix)
+        B_bar = Δ ⊗ B
+        h_t = A_bar * h_{t-1} + B_bar * x_t
+        y_t = C · h_t
+    """
+
+    def __init__(self, d_model: int, d_inner: int, d_state: int = 16,
+                 d_conv: int = 4, dropout: float = 0.1):
         super().__init__()
-        self.num_experts = num_experts
-        self.top_k = top_k
-        self.router = nn.Linear(d_model, num_experts, bias=False)
-        self.latent_router = nn.Linear(d_model, num_experts, bias=False)
-        self.experts = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(d_model, 4 * d_model),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(4 * d_model, d_model),
-                nn.Dropout(dropout)
-            ) for _ in range(num_experts)
-        ])
-        
-    def forward(self, x: torch.Tensor, latent_code: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        B, T, D = x.shape
-        x_flat = x.view(-1, D)
-        
-        route_logits = self.router(x_flat) # (B*T, num_experts)
-        if latent_code is not None:
-            # latent_code is (B, D)
-            lat_route = self.latent_router(latent_code) # (B, num_experts)
-            lat_route = lat_route.unsqueeze(1).expand(B, T, self.num_experts) # (B, T, num_experts)
-            route_logits = route_logits + lat_route.reshape(B * T, self.num_experts)
-            
-        routing_probs = F.softmax(route_logits, dim=-1)
-        routing_weights, selected_experts = torch.topk(routing_probs, self.top_k, dim=-1)
-        routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True) # normalize
-        
-        out = torch.zeros_like(x_flat)
-        # process experts
-        for i, expert in enumerate(self.experts):
-            idx, nth_expert = torch.where(selected_experts == i)
-            if idx.numel() > 0:
-                expert_out = expert(x_flat[idx])
-                w = routing_weights[idx, nth_expert].unsqueeze(-1)
-                out[idx] += w * expert_out
+        self.d_model = d_model
+        self.d_inner = d_inner
+        self.d_state = d_state
 
-        # Balance loss computing
-        prob_mean = routing_probs.mean(dim=0)
-        zeros = torch.zeros_like(route_logits)
-        zeros.scatter_(1, selected_experts, 1.0)
-        frac_mean = zeros.mean(dim=0)
-        balance_loss = self.num_experts * torch.sum(prob_mean * frac_mean)
-        
-        return out.view(B, T, D), balance_loss
+        # Pre-norm
+        self.norm = nn.LayerNorm(d_model)
+
+        # Expansion: d_model → 2*d_inner  (split into x_branch + gate)
+        self.in_proj = nn.Linear(d_model, 2 * d_inner, bias=False)
+
+        # 1-D causal depthwise convolution (applied to x_branch)
+        self.conv1d = nn.Conv1d(
+            d_inner, d_inner,
+            kernel_size=d_conv,
+            padding=d_conv - 1,   # causal: we'll truncate later
+            groups=d_inner,
+            bias=True,
+        )
+
+        # SSM parameters projected from input (selective mechanism)
+        # Δ (dt), B, C  — all input-dependent
+        self.x_proj = nn.Linear(d_inner, d_state * 2 + 1, bias=False)
+        # dt_proj converts the scalar Δ_raw to d_inner channels
+        self.dt_proj = nn.Linear(1, d_inner, bias=True)
+
+        # A is a learned (d_inner, d_state) parameter (log-space, negative)
+        A = torch.arange(1, d_state + 1, dtype=torch.float32).unsqueeze(0).expand(d_inner, -1)
+        self.A_log = nn.Parameter(torch.log(A))
+
+        # D (skip connection inside SSM)
+        self.D = nn.Parameter(torch.ones(d_inner))
+
+        # Output projection: d_inner → d_model
+        self.out_proj = nn.Linear(d_inner, d_model, bias=False)
+        self.dropout = nn.Dropout(dropout)
+
+    def _ssm_scan(self, x: torch.Tensor, dt: torch.Tensor,
+                  B: torch.Tensor, C: torch.Tensor) -> torch.Tensor:
+        """
+        Parallel-friendly selective scan.
+
+        Args:
+            x:  (B, T, d_inner)
+            dt: (B, T, d_inner)   — discretisation time-step (after softplus)
+            B:  (B, T, d_state)
+            C:  (B, T, d_state)
+
+        Returns:
+            y:  (B, T, d_inner)
+        """
+        batch, T, d_inner = x.shape
+        d_state = B.shape[-1]
+
+        # Discretise A
+        A = -torch.exp(self.A_log)  # (d_inner, d_state) — negative eigenvalues
+
+        # We chunk-scan for memory efficiency on CPU
+        # (A full parallel scan is GPU-optimal; a simple loop is clearest for CPU)
+        h = torch.zeros(batch, d_inner, d_state, device=x.device, dtype=x.dtype)
+        ys = []
+
+        for t in range(T):
+            dt_t = dt[:, t, :]                    # (B, d_inner)
+            x_t  = x[:, t, :]                     # (B, d_inner)
+            B_t  = B[:, t, :]                      # (B, d_state)
+            C_t  = C[:, t, :]                      # (B, d_state)
+
+            # A_bar = exp(dt * A)  — element-wise over (d_inner, d_state)
+            A_bar = torch.exp(dt_t.unsqueeze(-1) * A.unsqueeze(0))  # (B, d_inner, d_state)
+            # B_bar = dt * B — broadcast outer product
+            B_bar = dt_t.unsqueeze(-1) * B_t.unsqueeze(1)  # (B, d_inner, d_state)
+
+            h = A_bar * h + B_bar * x_t.unsqueeze(-1)  # (B, d_inner, d_state)
+            y_t = (h * C_t.unsqueeze(1)).sum(dim=-1)    # (B, d_inner)
+            ys.append(y_t)
+
+        return torch.stack(ys, dim=1)  # (B, T, d_inner)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (B, T, d_model) → (B, T, d_model)"""
+        residual = x
+        x = self.norm(x)
+
+        # Expand
+        xz = self.in_proj(x)  # (B, T, 2*d_inner)
+        x_branch, z = xz.chunk(2, dim=-1)  # each (B, T, d_inner)
+
+        # Causal conv on x_branch
+        # Conv1d expects (B, C, T)
+        x_branch = x_branch.transpose(1, 2)
+        x_branch = self.conv1d(x_branch)[:, :, :x.size(1)]  # causal truncation
+        x_branch = x_branch.transpose(1, 2)
+        x_branch = F.silu(x_branch)
+
+        # SSM parameters from input (selective)
+        ssm_params = self.x_proj(x_branch)   # (B, T, 2*d_state + 1)
+        dt_raw = ssm_params[:, :, :1]        # (B, T, 1)
+        B_param = ssm_params[:, :, 1:1 + self.d_state]
+        C_param = ssm_params[:, :, 1 + self.d_state:]
+
+        # dt: project to d_inner channels, then softplus
+        dt = F.softplus(self.dt_proj(dt_raw))  # (B, T, d_inner)
+
+        # SSM scan
+        y = self._ssm_scan(x_branch, dt, B_param, C_param)  # (B, T, d_inner)
+
+        # Skip connection (D)
+        y = y + self.D.unsqueeze(0).unsqueeze(0) * x_branch
+
+        # Gate with z
+        y = y * F.silu(z)
+
+        # Project back
+        y = self.out_proj(y)
+        y = self.dropout(y)
+
+        return residual + y
 
 
-class LatentMoETransformerLayer(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1, num_experts: int = 8, top_k: int = 2):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(d_model)
-        self.attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.moe = MoEFeedForward(d_model, num_experts, top_k, dropout)
-        
-    def forward(self, x: torch.Tensor, mask: torch.Tensor = None, latent_code: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        h = self.norm1(x)
-        attn_out, _ = self.attn(h, h, h, attn_mask=mask, need_weights=False)
-        x = x + attn_out
-        
-        h = self.norm2(x)
-        moe_out, bal_loss = self.moe(h, latent_code=latent_code)
-        x = x + moe_out
-        return x, bal_loss
+class SSMCausalLM(nn.Module):
+    """
+    Causal Language Model built from stacked SelectiveSSMBlocks.
 
+    Architecture:
+        Token Embedding + Positional Embedding
+        → N × SelectiveSSMBlock
+        → LayerNorm → Linear head → logits
+    """
 
-class TinyCausalTransformer(nn.Module):
-    def __init__(self, vocab_size: int, d_model: int = 64, n_layers: int = 2, n_heads: int = 4, dropout: float = 0.1, max_len: int = 2048, num_experts: int = 8, top_k: int = 2):
+    def __init__(self, vocab_size: int, d_model: int = 64, n_layers: int = 2,
+                 d_state: int = 16, d_conv: int = 4, expand: int = 2,
+                 dropout: float = 0.1, max_len: int = 2048):
         super().__init__()
         self.vocab_size = vocab_size
         self.d_model = d_model
+        d_inner = d_model * expand
+
         self.tok = nn.Embedding(vocab_size, d_model)
         self.pos = nn.Embedding(max_len, d_model)
+
         self.layers = nn.ModuleList([
-            LatentMoETransformerLayer(d_model, n_heads, dropout, num_experts, top_k)
+            SelectiveSSMBlock(d_model, d_inner, d_state, d_conv, dropout)
             for _ in range(n_layers)
         ])
+
         self.ln = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, vocab_size, bias=False)
 
-    def forward_embeds(self, x_emb: torch.Tensor, latent_code: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        """x_emb: (B, T, d) -> logits (B, T, V), with causal structure."""
+    def forward_embeds(self, x_emb: torch.Tensor,
+                       latent_code: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        x_emb: (B, T, d_model) — embeddings with latent prefix already prepended
+        latent_code: unused for API compat (the latent is injected as a prefix token)
+        Returns: (logits (B, T, V), aux_loss=0.0)
+        """
         B, T, _ = x_emb.shape
         pos = torch.arange(T, device=x_emb.device).unsqueeze(0).expand(B, T)
         x = x_emb + self.pos(pos)
-        causal = torch.triu(torch.ones(T, T, device=x_emb.device, dtype=torch.bool), diagonal=1)
-        
-        total_bal_loss = 0.0
+
         for layer in self.layers:
-            x, bal = layer(x, mask=causal, latent_code=latent_code)
-            total_bal_loss = total_bal_loss + bal
-            
+            x = layer(x)
+
         x = self.ln(x)
-        return self.head(x), total_bal_loss
+        return self.head(x), torch.tensor(0.0, device=x_emb.device)
 
     def tokens_to_embeds(self, input_ids: torch.Tensor) -> torch.Tensor:
         B, T = input_ids.shape
@@ -248,9 +334,9 @@ class TinyCausalTransformer(nn.Module):
         return self.tok(input_ids) + self.pos(pos)
 
 
-# -----------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # Batching utilities
-# -----------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def make_blocks(tokens: np.ndarray, block: int, overlap: float) -> List[np.ndarray]:
@@ -261,12 +347,12 @@ def make_blocks(tokens: np.ndarray, block: int, overlap: float) -> List[np.ndarr
     for i in range(0, max(0, tokens.size - block + 1), step):
         out.append(tokens[i : i + block])
     if not out and tokens.size >= 2:
-        # very short: still return one block (truncate)
         out.append(tokens[:block])
     return out
 
 
-def batch_iter(examples: List[Tuple[int, np.ndarray]], batch_size: int, seed: int) -> List[List[Tuple[int, np.ndarray]]]:
+def batch_iter(examples: List[Tuple[int, np.ndarray]], batch_size: int,
+               seed: int) -> List[List[Tuple[int, np.ndarray]]]:
     rng = np.random.default_rng(seed)
     idx = np.arange(len(examples))
     rng.shuffle(idx)
@@ -276,9 +362,9 @@ def batch_iter(examples: List[Tuple[int, np.ndarray]], batch_size: int, seed: in
     return batches
 
 
-# -----------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # Training + evaluation primitives
-# -----------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def nll_from_logits(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
@@ -295,46 +381,53 @@ def ppl_from_nll(nll_per_token: float) -> float:
         return float("inf")
 
 
-# -----------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # Main routine
-# -----------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--train-fasta", nargs="+", required=True, help="Training sample FASTA/FASTA.GZ files")
-    ap.add_argument("--eval-fasta", nargs="+", required=True, help="Evaluation sample FASTA/FASTA.GZ files")
+    ap = argparse.ArgumentParser(description="SSM (Mamba-style) Subliminal Sample LM")
+    ap.add_argument("--train-fasta", nargs="+", required=True)
+    ap.add_argument("--eval-fasta", nargs="+", required=True)
 
+    # Tokenizer
     ap.add_argument("--kmer", type=int, default=31)
     ap.add_argument("--stride", type=int, default=1)
     ap.add_argument("--vocab-size", type=int, default=32768)
     ap.add_argument("--no-rc", action="store_true")
+    ap.add_argument("--max-tokens", type=int, default=0)
 
+    # SSM architecture
     ap.add_argument("--d-model", type=int, default=64)
     ap.add_argument("--layers", type=int, default=2)
-    ap.add_argument("--heads", type=int, default=4)
+    ap.add_argument("--d-state", type=int, default=16, help="SSM state dimension N")
+    ap.add_argument("--d-conv", type=int, default=4, help="Causal conv kernel width")
+    ap.add_argument("--expand", type=int, default=2, help="Inner expansion factor")
     ap.add_argument("--dropout", type=float, default=0.1)
 
+    # Kept for CLI compat with runner (ignored by SSM)
+    ap.add_argument("--heads", type=int, default=4)
     ap.add_argument("--num-experts", type=int, default=8)
     ap.add_argument("--top-k", type=int, default=2)
     ap.add_argument("--moe-loss-weight", type=float, default=0.01)
 
-    ap.add_argument("--code-dim", type=int, default=64, help="Latent sample code dim (defaults to d_model)")
+    # Latent code
+    ap.add_argument("--code-dim", type=int, default=64)
     ap.add_argument("--code-l2", type=float, default=1e-3)
     ap.add_argument("--code-dropout", type=float, default=0.1)
 
+    # Training
     ap.add_argument("--train-block", type=int, default=128)
     ap.add_argument("--train-overlap", type=float, default=0.5)
     ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--lr", type=float, default=3e-4)
-    
-    ap.add_argument("--max-tokens", type=int, default=0, help="Hard truncation limit per genome")
-    ap.add_argument("--pred-k", type=int, default=1, help="Multi-token prediction window")
+    ap.add_argument("--pred-k", type=int, default=1)
 
+    # Eval
     ap.add_argument("--embed-block", type=int, default=256)
-    ap.add_argument("--embed-step", type=int, default=256, help="Not used (kept for compatibility)")
-
+    ap.add_argument("--embed-step", type=int, default=256)
     ap.add_argument("--adapt-steps", type=int, default=50)
     ap.add_argument("--adapt-lr", type=float, default=0.1)
 
@@ -344,16 +437,13 @@ def main():
 
     args = ap.parse_args()
 
+    # ── Expand globs ──────────────────────────────────────────────────────────
     def expand_globs(paths: List[str]) -> List[str]:
         expanded: List[str] = []
         for p in paths:
             if any(ch in p for ch in ("*", "?", "[")):
                 matches = sorted(glob.glob(p))
-                if not matches:
-                    # Keep the literal path so the error message is informative.
-                    expanded.append(p)
-                else:
-                    expanded.extend(matches)
+                expanded.extend(matches if matches else [p])
             else:
                 expanded.append(p)
         return expanded
@@ -365,11 +455,16 @@ def main():
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    print("[subliminal] fixed-subliminal-sample-lm-0.3.0")
+    print("=" * 70)
+    print("   SSM (Selective State Space Model / Mamba-style) Sample LM")
+    print("=" * 70)
     device = torch.device(args.device)
     print(f"[Device] {device}")
 
-    tok_cfg = TokenizerCfg(kmer=args.kmer, stride=args.stride, vocab_size=args.vocab_size, no_rc=args.no_rc, max_tokens=args.max_tokens)
+    tok_cfg = TokenizerCfg(
+        kmer=args.kmer, stride=args.stride,
+        vocab_size=args.vocab_size, no_rc=args.no_rc, max_tokens=args.max_tokens,
+    )
 
     def sample_id_from_path(p: str) -> str:
         base = os.path.basename(p)
@@ -381,15 +476,16 @@ def main():
 
     train_paths = args.train_fasta
     eval_paths = args.eval_fasta
-
     train_ids = [sample_id_from_path(p) for p in train_paths]
     eval_ids = [sample_id_from_path(p) for p in eval_paths]
 
-    # Tokenize
-    print(f"[Tokenize] train_samples={len(train_paths)} eval_samples={len(eval_paths)}")
+    # ── Tokenize ──────────────────────────────────────────────────────────────
+    t_wall_start = time.time()
+    print(f"\n[Tokenize] train_samples={len(train_paths)} eval_samples={len(eval_paths)}")
     train_tokens: Dict[str, np.ndarray] = {}
     eval_tokens: Dict[str, np.ndarray] = {}
 
+    t_tok_start = time.time()
     for p, sid in zip(train_paths, train_ids):
         t = tokenize_sample_fasta(p, tok_cfg)
         train_tokens[sid] = t
@@ -400,8 +496,10 @@ def main():
         eval_tokens[sid] = t
         split = "train" if sid in train_tokens else "eval"
         print(f"  - {sid} ({split}): tokens={t.size}")
+    t_tok_end = time.time()
+    print(f"\n⏱  Tokenisation: {t_tok_end - t_tok_start:.2f}s")
 
-    # Build training examples (sample_index, token_block)
+    # ── Build training examples ───────────────────────────────────────────────
     sample_index = {sid: i for i, sid in enumerate(train_ids)}
     examples: List[Tuple[int, np.ndarray]] = []
     for sid in train_ids:
@@ -413,21 +511,28 @@ def main():
     if len(examples) == 0:
         raise SystemExit("No training blocks produced; check FASTA content.")
 
-    # Model
+    print(f"[Data] {len(examples)} training blocks (block={args.train_block}, overlap={args.train_overlap})")
+
+    # ── Model ─────────────────────────────────────────────────────────────────
     d_model = args.d_model
     code_dim = args.code_dim if args.code_dim > 0 else d_model
 
-    lm = TinyCausalTransformer(
-        args.vocab_size, 
-        d_model=d_model, 
-        n_layers=args.layers, 
-        n_heads=args.heads, 
-        dropout=args.dropout, 
-        max_len=max(2048, args.train_block + 1),
-        num_experts=args.num_experts,
-        top_k=args.top_k
+    lm = SSMCausalLM(
+        args.vocab_size,
+        d_model=d_model,
+        n_layers=args.layers,
+        d_state=args.d_state,
+        d_conv=args.d_conv,
+        expand=args.expand,
+        dropout=args.dropout,
+        max_len=max(2048, args.train_block + 2),
     ).to(device)
-    # sample codes for training set
+
+    n_params = sum(p.numel() for p in lm.parameters())
+    print(f"[Model] SSM  layers={args.layers}  d_model={d_model}  d_state={args.d_state}  "
+          f"d_conv={args.d_conv}  expand={args.expand}")
+    print(f"[Model] Total LM params: {n_params:,}")
+
     code_table = nn.Embedding(len(train_ids), code_dim).to(device)
     code_proj = nn.Linear(code_dim, d_model, bias=False).to(device) if code_dim != d_model else None
     code_do = nn.Dropout(args.code_dropout)
@@ -438,9 +543,15 @@ def main():
 
     opt = torch.optim.AdamW(params, lr=args.lr)
 
-    # Training
+    # ── Training ──────────────────────────────────────────────────────────────
+    print(f"\n{'─'*50}")
+    print(f"  TRAINING  —  epochs={args.epochs}  batch={args.batch}  lr={args.lr}")
+    print(f"{'─'*50}")
+    t_train_start = time.time()
     lm.train()
+
     for epoch in range(1, args.epochs + 1):
+        t_ep_start = time.time()
         batches = batch_iter(examples, args.batch, seed=args.seed + epoch)
         losses = []
         for batch in batches:
@@ -452,21 +563,20 @@ def main():
             if code_proj is not None:
                 code = code_proj(code)
             code = code_do(code).unsqueeze(1)  # (B,1,d)
-            tok_emb = lm.tok(x)  # (B,T,d)
+            tok_emb = lm.tok(x)                # (B,T,d)
             x_emb = torch.cat([code, tok_emb], dim=1)  # (B,T+1,d)
 
-            logits, bal_loss = lm.forward_embeds(x_emb, latent_code=code.squeeze(1))  # (B,T+1,V)
-            
+            logits, aux = lm.forward_embeds(x_emb, latent_code=code.squeeze(1))
+
             nll_sum = 0.0
             for k in range(1, args.pred_k + 1):
                 logits_use = logits[:, :-k, :]
-                targets = x[:, k-1:]
+                targets = x[:, k - 1 :]
                 nll_sum += nll_from_logits(logits_use, targets).mean()
             nll = nll_sum / args.pred_k
 
-            # L2 on codes to discourage memorization and add balancer
-            l2 = (code_table.weight.pow(2).sum(dim=1).mean())
-            loss = nll + args.code_l2 * l2 + args.moe_loss_weight * bal_loss
+            l2 = code_table.weight.pow(2).sum(dim=1).mean()
+            loss = nll + args.code_l2 * l2
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -475,24 +585,26 @@ def main():
 
             losses.append(float(loss.detach().cpu()))
 
-        print(f"[Train] epoch {epoch}/{args.epochs} loss={np.mean(losses):.4f}")
+        t_ep_end = time.time()
+        print(f"  [Epoch {epoch}/{args.epochs}] loss={np.mean(losses):.4f}  "
+              f"({t_ep_end - t_ep_start:.1f}s)")
 
+    t_train_end = time.time()
+    print(f"\n⏱  Training total: {t_train_end - t_train_start:.2f}s")
     lm.eval()
 
-    # Save config
+    # ── Save config ───────────────────────────────────────────────────────────
     cfg_out = dict(vars(args))
-    cfg_out.update({"train_ids": train_ids, "eval_ids": eval_ids})
+    cfg_out.update({"train_ids": train_ids, "eval_ids": eval_ids,
+                    "architecture": "ssm_mamba", "n_params": n_params})
     with open(os.path.join(args.save, "config.json"), "w", encoding="utf-8") as f:
         json.dump(cfg_out, f, indent=2)
 
     # Extract train codes
     with torch.no_grad():
         train_codes = code_table.weight.detach().cpu().numpy().astype(np.float32)
-        if code_proj is not None:
-            # keep original code space; projection is model internal
-            pass
 
-    # Helper to score and embed a sample given a code vector (d_model)
+    # ── Helper: score and embed ───────────────────────────────────────────────
     def score_and_pool(tokens: np.ndarray, code_vec_d: torch.Tensor) -> Tuple[float, np.ndarray]:
         blocks = make_blocks(tokens, args.train_block, args.train_overlap)
         if not blocks:
@@ -504,22 +616,17 @@ def main():
             with torch.no_grad():
                 tok_emb = lm.tok(x)
                 x_emb = torch.cat([code_vec_d[None, None, :], tok_emb], dim=1)
-                # forward through encoder to get hidden states
-                # reuse forward_embeds but we also want h; easiest: re-run parts
-                B, T1, _ = x_emb.shape
-                pos = torch.arange(T1, device=device).unsqueeze(0).expand(B, T1)
+                B_, T1, _ = x_emb.shape
+                pos = torch.arange(T1, device=device).unsqueeze(0).expand(B_, T1)
                 h = x_emb + lm.pos(pos)
-                causal = torch.triu(torch.ones(T1, T1, device=device, dtype=torch.bool), diagonal=1)
-                
-                lat_code = code_vec_d.unsqueeze(0).expand(B, -1)
                 for layer in lm.layers:
-                    h, _ = layer(h, mask=causal, latent_code=lat_code)
+                    h = layer(h)
                 h = lm.ln(h)
                 logits = lm.head(h)
                 logits_use = logits[:, :-1, :]
-                nll_tok = nll_from_logits(logits_use, x).squeeze(0)  # (T,)
+                nll_tok = nll_from_logits(logits_use, x).squeeze(0)
                 all_nll.append(nll_tok.detach().cpu().numpy())
-                # pooled hidden states excluding prefix
+                # Pool hidden states (excluding prefix)
                 h_tok = h[:, 1:, :].squeeze(0).detach().cpu().numpy()
                 all_h.append(h_tok)
         nll_all = np.concatenate(all_nll, axis=0)
@@ -529,28 +636,31 @@ def main():
         pooled = h_all.mean(axis=0).astype(np.float32)
         return ppl, pooled
 
-    # Build a mean code in d_model space for base scoring
+    # Mean code
     with torch.no_grad():
         mean_code = torch.tensor(train_codes.mean(axis=0), dtype=torch.float32, device=device)
-        if code_proj is not None:
-            mean_code_d = code_proj(mean_code)
-        else:
-            mean_code_d = mean_code
+        mean_code_d = code_proj(mean_code) if code_proj is not None else mean_code
 
-    # Evaluate + adapt
+    # ── Evaluate + adapt ──────────────────────────────────────────────────────
+    print(f"\n{'─'*50}")
+    print(f"  EVALUATION + ADAPTATION  —  adapt_steps={args.adapt_steps}")
+    print(f"{'─'*50}")
+
     rows = []
     latent_out = []
     pooled_out = []
     sample_out_ids = []
 
+    t_eval_start = time.time()
     for sid in eval_ids:
+        t_sample_start = time.time()
         tokens = eval_tokens[sid]
         split = "train" if sid in sample_index else "eval"
 
         # base: use mean train code
         ppl_base, pooled_base = score_and_pool(tokens, mean_code_d)
 
-        # start code init
+        # init code
         if split == "train":
             with torch.no_grad():
                 c0 = torch.tensor(train_codes[sample_index[sid]], dtype=torch.float32, device=device)
@@ -558,11 +668,10 @@ def main():
             with torch.no_grad():
                 c0 = torch.tensor(train_codes.mean(axis=0), dtype=torch.float32, device=device)
 
-        # Adapt by optimizing only code vector in *code space* (before projection)
+        # Adapt
         c = c0.clone().detach().requires_grad_(True)
         opt_c = torch.optim.Adam([c], lr=args.adapt_lr)
 
-        # freeze LM
         for p in lm.parameters():
             p.requires_grad_(False)
         if code_proj is not None:
@@ -572,24 +681,21 @@ def main():
         best = float("inf")
         best_c = None
 
-        # Pre-compute blocks once; subsample per step to avoid OOM
         all_adapt_blocks = make_blocks(tokens, args.train_block, args.train_overlap)
-        MAX_ADAPT_BLOCKS = 256  # cap to prevent GPU OOM on large samples
+        MAX_ADAPT_BLOCKS = 256
 
         for step in range(1, args.adapt_steps + 1):
             opt_c.zero_grad(set_to_none=True)
-            # Project to d_model if needed
             c_d = code_proj(c) if code_proj is not None else c
             if not all_adapt_blocks:
                 break
-            # Subsample blocks if too many
             if len(all_adapt_blocks) > MAX_ADAPT_BLOCKS:
                 rng_adapt = np.random.default_rng(args.seed + step)
                 idxs = rng_adapt.choice(len(all_adapt_blocks), MAX_ADAPT_BLOCKS, replace=False)
                 blocks = [all_adapt_blocks[i] for i in idxs]
             else:
                 blocks = all_adapt_blocks
-            # Accumulate NLL without keeping full graph — use running mean
+
             nll_sum = torch.tensor(0.0, device=device)
             n_blocks = 0
             for b in blocks:
@@ -597,19 +703,17 @@ def main():
                 tok_emb = lm.tok(x)
                 x_emb = torch.cat([c_d[None, None, :], tok_emb], dim=1)
                 logits, _ = lm.forward_embeds(x_emb, latent_code=c_d.unsqueeze(0))
-                
+
                 nll_s = 0.0
                 for k in range(1, args.pred_k + 1):
                     logits_use = logits[:, :-k, :]
-                    targets = x[:, k-1:]
+                    targets = x[:, k - 1 :]
                     nll_s += float(nll_from_logits(logits_use, targets).mean())
-                nll = nll_s / args.pred_k
-                
-                nll_sum = nll_sum + torch.tensor(nll, device=device)
+                nll_sum = nll_sum + torch.tensor(nll_s / args.pred_k, device=device)
                 n_blocks += 1
+
             nll_mean = nll_sum / max(1, n_blocks)
-            # regularize code
-            loss = nll_mean + args.code_l2 * (c.pow(2).mean())
+            loss = nll_mean + args.code_l2 * c.pow(2).mean()
             loss.backward()
             torch.nn.utils.clip_grad_norm_([c], 1.0)
             opt_c.step()
@@ -628,6 +732,7 @@ def main():
             ppl_adapt, pooled_adapt = score_and_pool(tokens, best_c_d)
 
         delta = float(ppl_base - ppl_adapt)
+        t_sample_end = time.time()
 
         rows.append({
             "sample_id": sid,
@@ -636,18 +741,23 @@ def main():
             "ppl_base": float(ppl_base),
             "ppl_adapt": float(ppl_adapt),
             "delta_ppl": delta,
+            "time_s": round(t_sample_end - t_sample_start, 2),
         })
 
         latent_out.append(best_c.detach().cpu().numpy().astype(np.float32))
         pooled_out.append(pooled_adapt.astype(np.float32))
         sample_out_ids.append(sid)
 
-        print(f"[Eval] {sid} split={split} ppl_base={ppl_base:.3f} ppl_adapt={ppl_adapt:.3f} delta={delta:.3f}")
+        print(f"  [Eval] {sid}  split={split}  ppl_base={ppl_base:.3f}  "
+              f"ppl_adapt={ppl_adapt:.3f}  Δ={delta:.3f}  ({t_sample_end - t_sample_start:.1f}s)")
+
+    t_eval_end = time.time()
+    print(f"\n⏱  Evaluation total: {t_eval_end - t_eval_start:.2f}s")
 
     latent_arr = np.stack(latent_out, axis=0)
     pooled_arr = np.stack(pooled_out, axis=0)
 
-    # Nearest neighbors on latent + pooled
+    # ── Nearest-neighbors ─────────────────────────────────────────────────────
     def nn_report(emb: np.ndarray) -> Dict[str, Tuple[str, float]]:
         if emb.shape[0] < 2:
             return {}
@@ -672,11 +782,11 @@ def main():
             r["nn1_pooled"] = nn_pool[sid][0]
             r["nn1_pooled_dist"] = nn_pool[sid][1]
 
-    # PCA projection for quick plotting
+    # PCA
     pca = PCA(n_components=2, random_state=args.seed)
     p2 = pca.fit_transform(pooled_arr)
 
-    # Save artifacts
+    # ── Save artifacts ────────────────────────────────────────────────────────
     import csv
 
     summary_path = os.path.join(args.save, "samples_summary.csv")
@@ -705,19 +815,42 @@ def main():
         "args": cfg_out,
     }, os.path.join(args.save, "model.pt"))
 
-    print(f"[OK] wrote: {summary_path}")
+    # ── Timing summary ────────────────────────────────────────────────────────
+    t_wall_end = time.time()
+    timing = {
+        "tokenisation_s": round(t_tok_end - t_tok_start, 2),
+        "training_s": round(t_train_end - t_train_start, 2),
+        "evaluation_s": round(t_eval_end - t_eval_start, 2),
+        "total_wall_s": round(t_wall_end - t_wall_start, 2),
+    }
+    with open(os.path.join(args.save, "timing.json"), "w") as f:
+        json.dump(timing, f, indent=2)
+
+    print(f"\n{'='*70}")
+    print("  TIMING SUMMARY")
+    print(f"{'='*70}")
+    print(f"  Tokenisation : {timing['tokenisation_s']:>8.2f}s")
+    print(f"  Training     : {timing['training_s']:>8.2f}s")
+    print(f"  Evaluation   : {timing['evaluation_s']:>8.2f}s")
+    print(f"  ─────────────────────────────")
+    print(f"  Total wall   : {timing['total_wall_s']:>8.2f}s")
+    print(f"{'='*70}")
+
+    print(f"\n[OK] wrote: {summary_path}")
     print(f"[OK] wrote: {pca_path}")
+    print(f"[OK] wrote: timing.json")
     print("[OK] wrote embeddings: embeddings_latent.npy + embeddings_pooled.npy")
     print(f"[OK] wrote model: {os.path.join(args.save, 'model.pt')}")
 
-    # console leaderboard
+    # Leaderboard
     print("\n=== Top samples by ppl_adapt (higher = more novel even after adaptation) ===")
     rows_sorted = sorted(rows, key=lambda x: x["ppl_adapt"], reverse=True)
     for r in rows_sorted:
         sid = r["sample_id"]
         nn1 = r.get("nn1_latent", "-")
         d1 = r.get("nn1_latent_dist", float("nan"))
-        print(f"{sid:12s} split={r['split']:5s} ppl_adapt={r['ppl_adapt']:.3f} delta={r['delta_ppl']:.3f} nn1_lat={nn1} ({d1:.4f})")
+        print(f"{sid:12s} split={r['split']:5s} ppl_adapt={r['ppl_adapt']:.3f} "
+              f"delta={r['delta_ppl']:.3f} nn1_lat={nn1} ({d1:.4f})  [{r['time_s']:.1f}s]")
 
 
 if __name__ == "__main__":
