@@ -74,3 +74,23 @@ Our 40-sample high-resolution validation (20 Marine vs. 20 Freshwater) reveals a
 - **Efficiency**: Map-Reduce style processing handles long-range dependencies with lower memory cost than standard attention.
 - **Interpretability**: VAE-regularized clustering provides direct biological insights into environmental shifts and sample similarity.
 - **Performance**: Mixture-of-Experts (MoE) provides massive model capacity with a low computational footprint per token.
+
+## 4. Information-Theoretic Framework
+
+We evaluate environmental "novelty" and "divergence" through three primary information metrics:
+
+### 4.1 Shannon Entropy ($H$)
+The model measures the raw complexity of a DNA sequence using Shannon Entropy:
+$$H(x) = -\sum_{i} P(x_i) \log_2 P(x_i)$$
+In our system, the **Perplexity (PP)** is related to entropy by $PP = 2^H$. A higher entropy indicates a more complex or diverse genomic sample (e.g., high-biodiversity Marine provinces).
+
+### 4.2 Information Gain ($\Delta I$)
+When the model adapts to a new environment (zero-shot adaptation), it gains information about that environment. We measure this **Information Gain** in bits-per-base:
+$$\Delta I = \log_2(PP_{base}) - \log_2(PP_{adapt})$$
+This represents the amount of "Surprise" that was removed by allowing the model to optimize its environmental latent code. A large $\Delta I$ indicates that the sample has a very distinct "Environmental Dialect" compared to the baseline.
+
+### 4.3 Mutual Information & KL-Divergence
+The **Variational Latent Space** is governed by the Information Bottleneck principle. The KL-Divergence term in our loss function ($D_{KL}(Q(z|x) || P(z))$) is an upper bound on the **Mutual Information** between the DNA sequence $x$ and the environmental latent $z$. This tells us how much "Specific Knowledge" the model has captured about the environmental province in its 64-dimensional latent vector.
+
+---
+*Next Step: Implementation of Hybrid SSM-MoE for linear-scaling information retention.*

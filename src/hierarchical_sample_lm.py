@@ -708,7 +708,9 @@ def main():
             best_c_d = code_proj(best_c) if code_proj is not None else best_c
             ppl_adapt, pooled_adapt = score_and_pool(tokens, best_c_d)
 
-        delta = float(ppl_base - ppl_adapt)
+        bpb_base = math.log(ppl_base) / math.log(2)
+        bpb_adapt = math.log(ppl_adapt) / math.log(2)
+        info_gain = bpb_base - bpb_adapt
 
         duration = time.time() - t_start_sample
         rows.append({
@@ -717,7 +719,9 @@ def main():
             "tokens": int(tokens.size),
             "ppl_base": float(ppl_base),
             "ppl_adapt": float(ppl_adapt),
-            "delta_ppl": delta,
+            "bpb_base": float(bpb_base),
+            "bpb_adapt": float(bpb_adapt),
+            "info_gain": float(info_gain),
             "time_seconds": duration,
         })
 
@@ -725,7 +729,7 @@ def main():
         pooled_out.append(pooled_adapt.astype(np.float32))
         sample_out_ids.append(sid)
 
-        print(f"  [{idx+1}/{len(eval_ids)}] {sid:30s} t={int(tokens.size):7d} dt={duration:5.2f}s  ppl={ppl_adapt:.2f}")
+        print(f"  [{idx+1}/{len(eval_ids)}] {sid:30s} t={int(tokens.size):7d} dt={duration:5.2f}s  IG={info_gain:.4f} bits")
 
     print(f"[Time Elapsed] Zero-Shot Adaptation executed in {time.time() - t_eval_start:.2f} seconds.")
 

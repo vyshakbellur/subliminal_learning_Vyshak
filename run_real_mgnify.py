@@ -307,7 +307,9 @@ def run_model(
     print(f"\n[Auto-Scale] Detected GPU Tier: {tier} ({gpu_name})")
     print(f"             Applying: d_model={cfg['d_model']}, layers={cfg['layers']}, batch={cfg['batch']}")
 
-    if arch == "hierarchical_moe":
+    if arch == "ssmoe":
+        lm_script = PROJECT_ROOT / "src" / "ssmoe_sample_lm.py"
+    elif arch == "hierarchical_moe":
         lm_script = PROJECT_ROOT / "src" / "hierarchical_moe_lm.py"
     elif arch == "hierarchical":
         lm_script = PROJECT_ROOT / "src" / "hierarchical_sample_lm.py"
@@ -352,7 +354,7 @@ def main() -> int:
     ap.add_argument("--adapt-steps",   type=int, default=3,   help="Adaptation steps per sample")
     ap.add_argument("--kl-weight",     type=float, default=0.01, help="Variational KL weight")
     ap.add_argument("--dry-run",       action="store_true",    help="Show plan without downloading")
-    ap.add_argument("--arch",          choices=["moe", "hierarchical", "ssm", "hierarchical_moe"], default="moe", help="Architecture to execute")
+    ap.add_argument("--arch",          choices=["moe", "hierarchical", "ssm", "hierarchical_moe", "ssmoe"], default="hierarchical", help="Architecture to execute")
     ap.add_argument("--seed",          type=int, default=42,   help="Random seed for data split")
     args = ap.parse_args()
 
