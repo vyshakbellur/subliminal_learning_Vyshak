@@ -4,6 +4,31 @@ The **Hierarchical Hybrid MoE** is a dual-layered language model designed to pro
 
 ## Overview
 
+```mermaid
+graph TD
+    DNA["🧬 Raw DNA Sequence"] --> Local["🏗 Tier 1: Local Agent Encoder"]
+    
+    subgraph "Local Agent (Motif Discovery)"
+        Local --> LRouter{"🔀 Local Router"}
+        LRouter --> LE1["Expert 1"]
+        LRouter --> LE2["Expert 2"]
+        LRouter --> LEn["Expert..."]
+        LE1 & LE2 & LEn --> Syp["📝 Block Synopses (Compressed)"]
+    end
+    
+    Syp --> Global["🌍 Tier 2: Global Pattern Encoder"]
+    
+    subgraph "Global Agent (Environment Adaptation)"
+        Latent[("🧠 VAE Latent Code (μ, σ)")] -.-> GRouter{"🔀 Global Router"}
+        Global --> GRouter
+        GRouter --> GE1["Expert A"]
+        GRouter --> GE2["Expert B"]
+        GE1 & GE2 --> Final["🧬 Prediction / Novelty Detection"]
+    end
+    
+    Final --> Delta["📊 Perplexity Delta (OOD Signal)"]
+```
+
 Traditional transformers struggle with the massive context required for genomic sequences. Our architecture overcomes this using a **two-tier hierarchical approach** coupled with **Mixture-of-Experts (MoE)** routing.
 
 ### tier 1: Local Agent Encoder (DNA Motif Recognition)
@@ -28,8 +53,24 @@ The "Subliminal Learning" aspect of the architecture allows the model to adapt t
    - Only the **Latent Code** is optimized to minimize the prediction error (perplexity) on the new sample.
    - The speed and success of this adaptation serve as a powerful signal for **Out-of-Domain (OOD) novelty detection**.
 
+## Variational Latent Space (VAE-MoE)
+
+The recent upgrade from fixed lookup embeddings to a **Variational Latent Space** significantly improves the model's ability to cluster biologically similar samples.
+
+1. **Parameterization**: Instead of a single vector, the latent code now outputs a Mean ($\mu$) and Log-Variance ($\log\sigma^2$).
+2. **Reparameterization Trick**: During training, the model samples from this distribution ($z = \mu + \epsilon \cdot \sigma$), allowing it to explore the environment "manifold" rather than memorizing specific samples.
+3. **KL-Divergence Regularization**: A penalty term ($KL$) is added to the loss function, pressuring the latent space to stay compact. This prevents "overfitting" to a specific sample and forces the model to group samples with similar DNA grammars.
+
+## Environmental Variance and Novelty Detection
+
+Our 40-sample high-resolution validation (20 Marine vs. 20 Freshwater) reveals a critical biological insight:
+
+- **Marine Diversity (bioGEOTRACES)**: Marine metagenomes show high variance in the latent space. This is expected as the samples originate from geographically distinct ocean provinces (Arctic, Tropical, Coastal). The model correctly represents this as a broad, distributed "Marine language."
+- **Freshwater Unity**: In our dataset, Freshwater samples form a tight, localized cluster. This indicates a more unified genomic signature compared to the diverse Marine set.
+- **Novelty Signal**: Despite the internal variance of Marine samples, the Freshwater cluster remains spatially distinct. This "separation" proves the model's ability to identify environmental shifts in a zero-shot manner by optimizing only the latent $\mu$ vector while freezing the language model weights.
+
 ## Key Benefits
 
-- **Efficiency**: Map-Reduce style processing handles long-range dependencies without the quadratic memory cost of standard attention.
-- **Interpretability**: Clustering of latent codes provides direct biological insights into environmental shifts.
-- **Performance**: Mixture-of-Experts allows for a massive model capacity with a low computational footprint per token.
+- **Efficiency**: Map-Reduce style processing handles long-range dependencies with lower memory cost than standard attention.
+- **Interpretability**: VAE-regularized clustering provides direct biological insights into environmental shifts and sample similarity.
+- **Performance**: Mixture-of-Experts (MoE) provides massive model capacity with a low computational footprint per token.

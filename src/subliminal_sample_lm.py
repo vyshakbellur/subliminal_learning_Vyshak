@@ -340,6 +340,7 @@ def main():
 
     ap.add_argument("--save", type=str, required=True)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--kl-weight", type=float, default=0.01, help="VAE KL weight (ignored in base MoE)")
     ap.add_argument("--device", type=str, default="cpu")
 
     args = ap.parse_args()
@@ -629,6 +630,7 @@ def main():
 
         delta = float(ppl_base - ppl_adapt)
 
+        duration = time.time() - t_start_sample
         rows.append({
             "sample_id": sid,
             "split": split,
@@ -636,13 +638,14 @@ def main():
             "ppl_base": float(ppl_base),
             "ppl_adapt": float(ppl_adapt),
             "delta_ppl": delta,
+            "time_seconds": duration,
         })
 
         latent_out.append(best_c.detach().cpu().numpy().astype(np.float32))
         pooled_out.append(pooled_adapt.astype(np.float32))
         sample_out_ids.append(sid)
 
-        print(f"[Eval] {sid} split={split} ppl_base={ppl_base:.3f} ppl_adapt={ppl_adapt:.3f} delta={delta:.3f}")
+        print(f"  [{idx+1}/{len(eval_ids)}] {sid:30s} t={int(tokens.size):7d} dt={duration:5.2f}s  ppl={ppl_adapt:.2f}")
 
     latent_arr = np.stack(latent_out, axis=0)
     pooled_arr = np.stack(pooled_out, axis=0)

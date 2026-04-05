@@ -617,12 +617,18 @@ def main():
     sample_out_ids = []
 
     t_eval_start = time.time()
-    for sid in eval_ids:
+    print(f"\n[Eval] Beginning zero-shot adaptation on {len(eval_ids)} samples...")
+    for idx, sid in enumerate(eval_ids):
+        t_start_sample = time.time()
         tokens = eval_tokens[sid]
         split = "train" if sid in sample_index else "eval"
 
-        # base: use mean train code
-        ppl_base, pooled_base = score_and_pool(tokens, mean_code_d)
+        # base: use mean train code (re-calculating to ensure fresh mean)
+        with torch.no_grad():
+            mean_c = torch.from_numpy(train_codes).to(device).mean(0)
+            # project to d_model for scoring
+            mean_c_d = code_proj(mean_c) if code_proj is not None else mean_c
+            ppl_base, pooled_base = score_and_pool(tokens, mean_c_d)
 
         # start code init
         if split == "train":
@@ -645,6 +651,7 @@ def main():
 
         best = float("inf")
         best_c = None
+        t_adapt_start = time.time()
 
         # Pre-compute blocks once; subsample per step to avoid OOM
         all_adapt_blocks = make_blocks(tokens, args.train_block, args.train_overlap)
@@ -703,6 +710,7 @@ def main():
 
         delta = float(ppl_base - ppl_adapt)
 
+        duration = time.time() - t_start_sample
         rows.append({
             "sample_id": sid,
             "split": split,
@@ -710,13 +718,14 @@ def main():
             "ppl_base": float(ppl_base),
             "ppl_adapt": float(ppl_adapt),
             "delta_ppl": delta,
+            "time_seconds": duration,
         })
 
         latent_out.append(best_c.detach().cpu().numpy().astype(np.float32))
         pooled_out.append(pooled_adapt.astype(np.float32))
         sample_out_ids.append(sid)
 
-        print(f"[Eval] {sid} split={split} ppl_base={ppl_base:.3f} ppl_adapt={ppl_adapt:.3f} delta={delta:.3f}")
+        print(f"  [{idx+1}/{len(eval_ids)}] {sid:30s} t={int(tokens.size):7d} dt={duration:5.2f}s  ppl={ppl_adapt:.2f}")
 
     print(f"[Time Elapsed] Zero-Shot Adaptation executed in {time.time() - t_eval_start:.2f} seconds.")
 
