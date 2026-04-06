@@ -354,6 +354,7 @@ def main() -> int:
     ap.add_argument("--adapt-steps",   type=int, default=3,   help="Adaptation steps per sample")
     ap.add_argument("--kl-weight",     type=float, default=0.01, help="Variational KL weight")
     ap.add_argument("--dry-run",       action="store_true",    help="Show plan without downloading")
+    ap.add_argument("--skip-training",  action="store_true",    help="Download data only (Save credits/GPU compute)")
     ap.add_argument("--arch",          choices=["moe", "hierarchical", "ssm", "hierarchical_moe", "ssmoe"], default="hierarchical", help="Architecture to execute")
     ap.add_argument("--seed",          type=int, default=42,   help="Random seed for data split")
     args = ap.parse_args()
@@ -473,6 +474,10 @@ def main() -> int:
     print(f"\n[Split] Total Marine: {len(marine_all)}")
     print(f"        Training:     {len(train_files)} samples")
     print(f"        Evaluation:   {len(eval_files)} total samples ({len(marine_all)-n_train} Marine Test + {len(train_files)} Marine Train + {len(eval_files)-len(marine_all)} OOD)")
+    
+    if args.skip_training:
+        print("\n[Skip] --skip-training set. Data is downloaded and staged. Exiting before model phase.")
+        return 0
 
     # ── Model phase ───────────────────────────────────────────────────────────
     out_dir_arch = PROJECT_ROOT / "outputs" / f"real_mgnify_{args.arch}"
