@@ -348,7 +348,8 @@ def main() -> int:
     ap.add_argument("--n-per-env",     type=int, default=5,    help="Samples per environment (0 for ALL)")
     ap.add_argument("--train-split",   type=float, default=0.8, help="Ratio of Marine samples for training")
     ap.add_argument("--max-mb",        type=int, default=30,   help="Max MB per sample download")
-    ap.add_argument("--skip-download", action="store_true",    help="Use existing data/samples_real/")
+    ap.add_argument("--data-dir",      default=str(PROJECT_ROOT / "data" / "samples_real"), help="Custom directory for FASTA samples")
+    ap.add_argument("--skip-download", action="store_true",    help="Use existing data in --data-dir")
     ap.add_argument("--device",        default="auto",         help="auto | mps | cpu")
     ap.add_argument("--epochs",        type=int, default=1,    help="Training epochs")
     ap.add_argument("--adapt-steps",   type=int, default=3,   help="Adaptation steps per sample")
@@ -404,46 +405,48 @@ def main() -> int:
         print(f"  Epochs: {args.epochs}, adapt_steps: {args.adapt_steps}, arch: {args.arch}")
         return 0
 
-    # ── Download phase ────────────────────────────────────────────────────────
-    sample_files: dict[str, list[Path]] = {"marine": [], "freshwater": []}
+    # ── Data Inventory & Download ─────────────────────────────────────────────
+    raw_dir = Path(args.data_dir)
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    
+    print(f"\n[Inventory] Checking samples in: {raw_dir}")
+    sample_files: dict[str, list[Path]] = {env: [] for env in STUDIES}
+    
+    # 1. First, check what we already have
+    for env in STUDIES:
+        # Look for env__*.fna.gz or env__*.fasta.gz
+        found = sorted(list(raw_dir.glob(f"{env}__*.fna.gz")) + list(raw_dir.glob(f"{env}__*.fasta.gz")))
+        sample_files[env] = [p for p in found if verify_fasta_gz(p) > 0]
+        if sample_files[env]:
+            print(f"  ✓ {env:12s}: {len(sample_files[env])} valid samples found")
+        else:
+            print(f"  ! {env:12s}: 0 samples found")
 
-    if args.skip_download:
-        print("\n[Skip download] Looking for existing files in", DATA_DIR)
-        for env in STUDIES:
-            found = sorted(DATA_DIR.glob(f"{env}__*.fna.gz"))[:args.n_per_env]
-            sample_files[env] = [p for p in found if verify_fasta_gz(p) > 0]
-            print(f"  {env}: {len(sample_files[env])} valid files found")
-    else:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
+    # 2. Download missing samples if needed
+    if not args.skip_download:
         for env, study_id in STUDIES.items():
-            print(f"\n[Fetch] {env.upper()} — study {study_id}")
-            analyses = get_analyses(study_id, args.n_per_env)
-            if not analyses:
-                print(f"  ✗ No analyses found for {study_id}. Check internet/VPN.")
-                continue
-            print(f"  Analyses: {analyses}")
-            for i, ana_id in enumerate(analyses, 1):
-                out = DATA_DIR / f"{env}__{i:02d}_{ana_id}.fna.gz"
-                # Skip if already downloaded and valid
-                if out.exists() and verify_fasta_gz(out) > 0:
-                    print(f"  [{i}/{args.n_per_env}] {out.name} already exists ✓")
-                    sample_files[env].append(out)
-                    continue
-                # Find download URL
-                url = find_fasta_url(ana_id)
-                if not url:
-                    print(f"  [{i}/{args.n_per_env}] {ana_id}: no FASTA URL found, skipping")
-                    continue
-                # Stream-download with size cap
-                if stream_download_gz(url, out, max_bytes):
-                    sample_files[env].append(out)
-                else:
-                    out.unlink(missing_ok=True)  # remove partial file
+            current_count = len(sample_files[env])
+            target = args.n_per_env if args.n_per_env > 0 else 999  # 0 means "all" but we cap at a reasonable default for safety
+            
+            if current_count < target:
+                needed = target - current_count
+                print(f"\n[Fetch] {env.upper()} (Target {target}, Have {current_count}, Need {needed}) — study {study_id}")
+                analyses = get_analyses(study_id, target)
+                # Filter out ones we already have by checking ana_id in filename
+                existing_ids = [p.name.split("__")[-1].replace(".fna.gz", "").replace(".fasta.gz", "") for p in sample_files[env]]
+                new_analyses = [a for a in analyses if a not in existing_ids][:needed]
+                
+                for i, ana_id in enumerate(new_analyses, current_count + 1):
+                    out = raw_dir / f"{env}__{i:02d}_{ana_id}.fna.gz"
+                    url = find_fasta_url(ana_id)
+                    if url and stream_download_gz(url, out, max_bytes):
+                        sample_files[env].append(out)
+                    else:
+                        out.unlink(missing_ok=True)
 
-    # ── Check we have enough data ─────────────────────────────────────────────
     n_marine     = len(sample_files["marine"])
     n_freshwater = len(sample_files["freshwater"])
-    print(f"\n[Data] marine={n_marine}  freshwater={n_freshwater}")
+    print(f"\n[Data] Final Inventory: marine={n_marine}  freshwater={n_freshwater}")
 
     if n_marine + n_freshwater < 2:
         print("\n[Error] Too few samples. Possible causes:")
