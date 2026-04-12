@@ -93,4 +93,14 @@ This represents the amount of "Surprise" that was removed by allowing the model 
 The **Variational Latent Space** is governed by the Information Bottleneck principle. The KL-Divergence term in our loss function ($D_{KL}(Q(z|x) || P(z))$) is an upper bound on the **Mutual Information** between the DNA sequence $x$ and the environmental latent $z$. This tells us how much "Specific Knowledge" the model has captured about the environmental province in its 64-dimensional latent vector.
 
 ---
-*Next Step: Implementation of Hybrid SSM-MoE for linear-scaling information retention.*
+## 5. Empirical Scale & Validation (400 Samples)
+
+The final architecture is validated against a massive, balanced metagenomic dataset:
+- **Marine Component**: 199 samples from MGYS00005294 (Mediterranean and Eastern Atlantic).
+- **Freshwater Component**: 199 samples from MGYS00006752 (Global rivers and lakes).
+
+### 5.1 Training Protocol
+The model is trained for 5 epochs on the full Marine subset. Cross-environmental "Surprise" is measured by comparing the **Bits-per-Base (BPB)** of Marine-trained models on Freshwater samples versus Marine-validation samples.
+
+### 5.2 Zero-Shot Novelty Detection
+A sample is classified as **"Environmental Novelty"** if its adaptation velocity (Information Gain over 20 cycles) fails to reach a 2% threshold compared to the baseline global model.
