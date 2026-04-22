@@ -37,9 +37,9 @@ from typing import Optional
 STUDIES = {
     "marine":     "MGYS00005294",   # bioGEOTRACES (Global Ocean)
     "freshwater": "MGYS00006752",   # Lakes & Ponds (Global)
-    "arctic":     "MGYS00005706",   # Arctic Ocean Metagenomes
+    "arctic":     "MGYS00005221",   # Arctic Ocean
     "benthic":    "MGYS00005063",   # Marine Benthic (Sediment)
-    "deepsea":    "MGYS00005126",   # Deep Sea Hydrothermal Vents
+    "deepsea":    "MGYS00002008",   # Deep Sea (Global)
 }
 API_BASE     = "https://www.ebi.ac.uk/metagenomics/api/v1"
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -345,7 +345,7 @@ def run_model(
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--n-per-env",     type=int, default=5,    help="Samples per environment (0 for ALL)")
+    ap.add_argument("--n-per-env",     type=int, default=30,   help="Samples per environment (0 for ALL)")
     ap.add_argument("--train-split",   type=float, default=0.8, help="Ratio of Marine samples for training")
     ap.add_argument("--max-mb",        type=int, default=30,   help="Max MB per sample download")
     ap.add_argument("--data-dir",      default=str(PROJECT_ROOT / "data" / "samples_real"), help="Custom directory for FASTA samples")
@@ -455,28 +455,42 @@ def main() -> int:
         print("\nFallback: run the synthetic demo with:  python scripts/run_demo.py")
         return 1
 
-    # ── Logic for Training Split (Marine only) ───────────────────────────────
+    # ── Logic for Training Split (Per category) ──────────────────────────────
     import random
     random.seed(args.seed)
     
-    marine_all = sample_files["marine"]
-    random.shuffle(marine_all)
-    
-    n_train = max(1, int(len(marine_all) * args.train_split))
-    train_files = marine_all[:n_train]
-    
-    # Eval on EVERYTHING downloaded
+    train_files = []
     eval_files = []
-    for env in STUDIES:
-        eval_files.extend(sample_files[env])
     
-    # Remove duplicates but keep order roughly (train followed by others)
+    for env, files in sample_files.items():
+        random.shuffle(files)
+        # Take 20 for train, next 10 for eval
+        env_train = files[:20]
+        env_eval = files[20:30]
+        
+        train_files.extend(env_train)
+        eval_files.extend(env_eval)
+        print(f"  {env:12s}: {len(env_train)} train, {len(env_eval)} eval")
+    
+    # Eval on EVERYTHING downloaded (train + test) or just test?
+    # Usually we want to see train samples again to see "adaptation" quality,
+    # but the user asked for 20 samples of training and 10 samples of testing.
+    # To be clear, we will evaluate on the 50 test samples.
+    # If the user wants to see the train samples too in the output, we can add them.
+    # The original script adds EVERYTHING to eval_files. Let's keep that but ensure we have at least our 50 test.
+    
+    # Remove duplicates but keep order (train followed by test)
     seen = set()
-    eval_files = [x for x in eval_files if not (x in seen or seen.add(x))]
+    final_eval = []
+    for x in eval_files + train_files:
+        if x not in seen:
+            final_eval.append(x)
+            seen.add(x)
+    eval_files = final_eval
     
-    print(f"\n[Split] Total Marine: {len(marine_all)}")
-    print(f"        Training:     {len(train_files)} samples")
-    print(f"        Evaluation:   {len(eval_files)} total samples ({len(marine_all)-n_train} Marine Test + {len(train_files)} Marine Train + {len(eval_files)-len(marine_all)} OOD)")
+    print(f"\n[Split] Total samples: {sum(len(f) for f in sample_files.values())}")
+    print(f"        Training:      {len(train_files)} samples (20 per env)")
+    print(f"        Evaluation:    {len(eval_files)} samples (10 test + 20 train per env)")
     
     if args.skip_training:
         print("\n[Skip] --skip-training set. Data is downloaded and staged. Exiting before model phase.")
